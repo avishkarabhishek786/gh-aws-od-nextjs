@@ -10,7 +10,7 @@ You will create a Next.js app, put it on GitHub, and set up a pipeline so that e
 
 1. You push code to GitHub. GitHub Actions (CI) builds a container image, tags it with the commit ID and a release number such as 1.0.7, and pushes it to ECR.
 2. Actions signs in to AWS, and then to Octopus Deploy, with short-lived OIDC credentials. There are no stored access keys or API keys.
-3. Actions creates an Octopus release with the same release number. Octopus Deploy (CD) deploys it: it records the tag in an SSM parameter, then starts an ASG Instance Refresh and waits for it to finish.
+3. Actions creates an Octopus release with the same release number and queues its deployment. Octopus Deploy (CD) deploys it: it records the tag in an SSM parameter, then starts an ASG Instance Refresh and waits for it to finish. Actions does not wait for the rollout, so Octopus, not the Actions run, shows whether a deployment succeeded.
 4. The ASG launches replacement instances first and removes old ones only after the new ones are healthy.
 5. Each new instance sits in a private subnet with no route to the internet. It reads the tag and pulls that image from ECR through VPC endpoints, then runs it. The ALB sends it traffic only after the health check passes.
 
@@ -623,7 +623,7 @@ This tutorial uses one environment and no approval, so every push deploys. Real 
 
 ### 5.3 Connect GitHub to Octopus and run the first deployment
 
-1. In Octopus open **Configuration → Users → Add service account**, name it `github-actions`, and give it a team or role that can create releases and deploy the project. On its page add an **OpenID Connect** identity with issuer `https://token.actions.githubusercontent.com` and the same subject you put in the AWS trust policy in step 3 of 4.8: the immutable `repo:GITHUB_OWNER@ID/acme-status@ID:ref:refs/heads/main` if your repository uses it, otherwise `repo:GITHUB_OWNER/acme-status:ref:refs/heads/main` ([GitHub Actions OIDC to Octopus](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-octopus-deploy)). Copy the service account's ID.
+1. In Octopus open **Configuration → Users → Add service account**, name it `github-actions`. Then open **Configuration → Teams → Add team**, name it `github-actions CI`, add the service account as a member, and under **User Roles** include **Release creator** and **Project deployer**, each scoped to the project `nextjs-alb-demo` and the environment `Demo`. Back on the service account's page add an **OpenID Connect** identity with issuer `https://token.actions.githubusercontent.com` and the same subject you put in the AWS trust policy in step 3 of 4.8: the immutable `repo:GITHUB_OWNER@ID/acme-status@ID:ref:refs/heads/main` if your repository uses it, otherwise `repo:GITHUB_OWNER/acme-status:ref:refs/heads/main` ([GitHub Actions OIDC to Octopus](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-octopus-deploy)). Copy the **Service Account Id** shown in the OpenID Connect section: a GUID such as `420f8a4f-...`, not the `Users-NNN` ID in the page URL.
 2. In GitHub add two more repository variables: `OCTOPUS_URL` (your Octopus address) and `OCTOPUS_SERVICE_ACCOUNT_ID`. No API key is stored anywhere.
 3. In the **Actions** tab open the last run and choose **Re-run all jobs**. The build is skipped because the image exists, and the Octopus steps now run.
 4. In Octopus open the project. Release `1.0.N` is deployed to `Demo`. The task log shows `Set image tag`, then `Roll out` reporting that the ASG does not exist yet.
@@ -779,7 +779,7 @@ git push
 while true; do curl -s -o /dev/null -w "%{http_code} " http://$ALB/; sleep 1; done
 ```
 
-3. Open the repo's **Actions** tab and watch the run build the image, push it and create the Octopus release. Then open that release in Octopus Deploy: its task log shows Set image tag, then Roll out, which keeps polling until the Instance Refresh succeeds, so a failed rollout turns the deployment red.
+3. Open the repo's **Actions** tab and watch the run build the image, push it, create the Octopus release and queue its deployment. The run goes green as soon as the deployment is queued. Then open that release in Octopus Deploy: its task log shows Set image tag, then Roll out, which keeps polling until the Instance Refresh succeeds, so a failed rollout turns the Octopus deployment red (the Actions run stays green).
 4. In AWS, open **Auto Scaling Groups → `nextjs-alb-demo-asg` → Instance refresh** and watch the percentage climb.
 5. The poller keeps printing `200` the whole time. With minimum healthy 100% and maximum 200%, the ASG first starts two new instances, waits for them to pass health checks and the 2-minute warm-up, and only then terminates the old ones.
 6. After about 6 to 8 minutes, press Ctrl+C and run `curl -s http://$ALB/ | grep -o 'Acme Status v2'`. It prints the new heading. In ECR there are now two images (each with a commit-ID tag and a release-number tag), and the parameter holds the new release number.
@@ -807,7 +807,7 @@ seq 1 3000 | xargs -P 40 -I{} curl -s -o /dev/null http://$ALB/api/burn &
 ```
 
 1. In the ASG, open **Monitoring → EC2** and watch **Average CPU utilization** climb past 30%.
-2. After 3 to 5 minutes the **Activity** tab shows new instances launching and **Desired capacity** rises toward 4.
+2. After 3 to 5 minutes the **Activity** tab shows new instances launching and **Desired capacity** rises toward 4. You may also see entries like "launched in response to an unhealthy instance needing to be replaced": a saturated t3.micro can answer health checks too slowly and get replaced. That is expected under this artificial load.
 3. Stop the load with `kill %1`. Scale-in takes about 15 minutes of low CPU, so don't wait for it.
 
 ### 7.7 Logs, access and image scanning
@@ -845,7 +845,7 @@ Two parts of this setup bill by the hour even when idle: the **interface endpoin
 12. **Log group.** **CloudWatch → Log groups**, select `/nextjs-alb-demo/app` → **Actions → Delete log group(s)**.
 13. **Parameter.** **Systems Manager → Parameter Store**, select `/nextjs-alb-demo/image-tag` → **Delete**.
 14. **IAM.** **Roles**: delete `nextjs-alb-demo-ec2-role` and `nextjs-alb-demo-github-ci` (their inline policies go with them). **Identity providers**: delete `token.actions.githubusercontent.com`, unless another project of yours uses it.
-15. **Octopus Deploy and its IAM pieces.** In IAM delete the role `nextjs-alb-demo-octopus-role` and the identity provider for your Octopus host. In Octopus delete the project `nextjs-alb-demo`, the `Demo` environment, the `aws-demo` account and the `github-actions` service account (or cancel the Octopus Cloud trial).
+15. **Octopus Deploy and its IAM pieces.** In IAM delete the role `nextjs-alb-demo-octopus-role` and the identity provider for your Octopus host. In Octopus delete, in this order, the project `nextjs-alb-demo`, the `aws-demo` account, the `Demo only` lifecycle, the `Demo` environment, the `github-actions CI` team and the `github-actions` service account (or cancel the Octopus Cloud trial). The account, lifecycle and environment cannot be deleted while the project still uses them.
 16. **GitHub.** Delete the repository variables `AWS_ROLE_ARN`, `OCTOPUS_URL` and `OCTOPUS_SERVICE_ACCOUNT_ID`, and delete the repository itself if you no longer need it (Settings → General → Danger Zone).
 
 ### Verify nothing is left
