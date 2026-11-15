@@ -61,4 +61,3 @@ jobs:
           project: nextjs-alb-demo
           release_number: ${{ env.RELEASE }}
           deploy_to: Demo
-          
