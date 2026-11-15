@@ -1,0 +1,63 @@
+name: build-and-release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # lets the job request OIDC tokens (for AWS and for Octopus)
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: nextjs-alb-demo
+  RELEASE: 1.0.${{ github.run_number }}   # image tag and Octopus release number
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image (skipped if this release's image exists)
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY"
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+               --image-ids imageTag="$RELEASE" >/dev/null 2>&1; then
+            echo "Image $RELEASE already exists, skipping build"
+          else
+            docker build --build-arg APP_VERSION="${GITHUB_SHA}" -t "$IMAGE:$RELEASE" .
+            docker tag "$IMAGE:$RELEASE" "$IMAGE:${GITHUB_SHA}"
+            docker push "$IMAGE:$RELEASE"
+            docker push "$IMAGE:${GITHUB_SHA}"
+          fi
+
+      - name: Log in to Octopus
+        if: ${{ vars.OCTOPUS_URL != '' }}
+        uses: OctopusDeploy/login@v1
+        with:
+          server: ${{ vars.OCTOPUS_URL }}
+          service_account_id: ${{ vars.OCTOPUS_SERVICE_ACCOUNT_ID }}
+
+      - name: Create the release and deploy it to Demo
+        if: ${{ vars.OCTOPUS_URL != '' }}
+        uses: OctopusDeploy/create-release-action@v3
+        with:
+          project: nextjs-alb-demo
+          release_number: ${{ env.RELEASE }}
+          deploy_to: Demo
