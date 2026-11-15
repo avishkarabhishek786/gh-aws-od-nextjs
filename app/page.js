@@ -23,7 +23,7 @@ export default async function Home() {
   const version = (process.env.APP_VERSION || 'dev').slice(0, 7);
   return (
     <main style={{ fontFamily: 'sans-serif', padding: 40 }}>
-      <h1>Acme Status</h1>
+      <h1>Acme Status v2</h1>
       <p>Version: <b>{version}</b></p>
       <p>Served by instance: <b>{id}</b></p>
       <p>Availability Zone: <b>{az}</b></p>
