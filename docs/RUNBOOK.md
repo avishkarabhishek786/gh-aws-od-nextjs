@@ -796,7 +796,7 @@ Because new instances read the parameter when they boot, any scale-out or self-h
 
 ### 7.5 Self-healing
 
-With the poller from 7.3 running, go to **EC2 → Instances** and terminate one `nextjs-alb-demo` instance (not the client). The poller keeps printing `200` because the other instance answers. In the ASG's **Activity** tab, a replacement launches within a minute or two, boots, pulls the current image and joins the target group.
+With the poller from 7.3 running, go to **EC2 → Instances** and terminate one `nextjs-alb-demo` instance (not the client). Expect a short blip of `502` or `000`: a terminated instance is not drained, so the ALB keeps sending it requests until three health checks fail (about 30 to 45 seconds with the 15-second interval). After that the poller prints `200` again because the other instance answers. Planned replacements (7.3) do not have this blip, because the ASG deregisters and drains instances before terminating them. In the ASG's **Activity** tab, a replacement launches within a minute or two, boots, pulls the current image and joins the target group.
 
 ### 7.6 Scale out under load
 
