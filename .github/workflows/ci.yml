@@ -54,10 +54,20 @@ jobs:
           server: ${{ vars.OCTOPUS_URL }}
           service_account_id: ${{ vars.OCTOPUS_SERVICE_ACCOUNT_ID }}
 
-      - name: Create the release and deploy it to Demo
+      - name: Create the release
         if: ${{ vars.OCTOPUS_URL != '' }}
         uses: OctopusDeploy/create-release-action@v3
         with:
+          space: Default
           project: nextjs-alb-demo
           release_number: ${{ env.RELEASE }}
-          deploy_to: Demo
+          ignore_existing: true   # a re-run reuses the release instead of failing
+
+      - name: Deploy it to Demo
+        if: ${{ vars.OCTOPUS_URL != '' }}
+        uses: OctopusDeploy/deploy-release-action@v3
+        with:
+          space: Default
+          project: nextjs-alb-demo
+          release_number: ${{ env.RELEASE }}
+          environments: Demo

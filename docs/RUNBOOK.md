@@ -349,7 +349,16 @@ GitHub Actions can prove its identity to AWS with a short-lived OpenID Connect (
 
 1. **IAM → Identity providers → Add provider**: type **OpenID Connect**, **Provider URL** `https://token.actions.githubusercontent.com`, **Audience** `sts.amazonaws.com`. Choose **Add provider**.
 2. **IAM → Roles → Create role**, choose **Web identity**. Select the provider `token.actions.githubusercontent.com` and audience `sts.amazonaws.com`. Enter your **GitHub organization** (`GITHUB_OWNER`), **GitHub repository** `acme-status` and **GitHub branch** `main`. Skip attaching policies, name the role `nextjs-alb-demo-github-ci` and create it.
-3. Open the role's **Trust relationships** tab and check that the condition names `repo:GITHUB_OWNER/acme-status:ref:refs/heads/main`. This is what stops any other repository or branch from assuming the role.
+3. Open the role's **Trust relationships** tab and check the `token.actions.githubusercontent.com:sub` condition. This is what stops any other repository or branch from assuming the role, and it must match the `sub` claim GitHub actually sends, character for character. Check which format your repository uses:
+
+   ```bash
+   gh api repos/GITHUB_OWNER/acme-status/actions/oidc/customization/sub
+   ```
+
+   - If the output contains `"use_immutable_subject":true`, GitHub sends the **immutable** subject, which adds the numeric owner and repository IDs. Copy the `sub_claim_prefix` value and append `:ref:refs/heads/main`, for example `repo:GITHUB_OWNER@27818433/acme-status@1458522198:ref:refs/heads/main`. The console wizard in step 2 writes the old format, so choose **Edit trust policy** and replace the `sub` value with this one.
+   - Otherwise the subject is the classic `repo:GITHUB_OWNER/acme-status:ref:refs/heads/main`, which the wizard already wrote.
+
+   The immutable form keeps working if the owner or repository is renamed, and it cannot be claimed by someone who later takes over the old name.
 4. **Add permissions → Create inline policy → JSON** with the policy below (replace `ACCOUNT_ID`), named `nextjs-alb-demo-ci`. It can push images to this one repository and nothing else; the rollout permissions belong to Octopus (4.9).
 5. Copy the role's **ARN** from its summary page. You need it in 5.1, for the GitHub variable AWS\_ROLE\_ARN.
 
@@ -386,7 +395,7 @@ GitHub Actions can prove its identity to AWS with a short-lived OpenID Connect (
 
 Octopus Deploy does the rollout, so it gets its own narrow role: write the version parameter and start a refresh on this one ASG. Like GitHub, Octopus signs in with short-lived OpenID Connect credentials. You need your Octopus URL for this step, so create your Octopus Cloud instance (or have your server ready) first. OIDC sign-in to AWS needs Octopus Server 2024.1 or later ([AWS accounts](https://octopus.com/docs/infrastructure/accounts/aws)).
 
-1. **IAM → Identity providers → Add provider**: type **OpenID Connect**, **Provider URL** your Octopus URL (for Octopus Cloud, `https://YOUR-INSTANCE.octopus.app`), **Audience** `api://default`. Choose **Add provider**.
+1. **IAM → Identity providers → Add provider**: type **OpenID Connect**, **Provider URL** your Octopus URL (for Octopus Cloud, `https://YOUR-INSTANCE.octopus.app`), **Audience** your Octopus host name without `https://` (for example `YOUR-INSTANCE.octopus.app`). Octopus puts the host name in the token's `aud` claim for AWS, not `api://default`; with the wrong audience every sign-in fails with "The web identity token provided could not be validated". Choose **Add provider**.
 2. **IAM → Roles → Create role**, choose **Custom trust policy**, paste Policy 1 below (replace `ACCOUNT_ID`, and `OCTOPUS_HOST` with the host name only, no `https://`), and name the role `nextjs-alb-demo-octopus-role`.
 3. **Add permissions → Create inline policy → JSON** with Policy 2 below (replace `ACCOUNT_ID`), named `nextjs-alb-demo-rollout`.
 4. Copy the role's **ARN**. You need it in 5.2, where you paste it into the Octopus AWS account (it does not go into GitHub).
@@ -399,16 +408,16 @@ Octopus Deploy does the rollout, so it gets its own narrow role: write the versi
   "Statement": [{
     "Effect": "Allow",
     "Principal": { "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/OCTOPUS_HOST" },
-    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Action": ["sts:AssumeRoleWithWebIdentity", "sts:TagSession"],
     "Condition": {
-      "StringEquals": { "OCTOPUS_HOST:aud": "api://default" },
+      "StringEquals": { "OCTOPUS_HOST:aud": "OCTOPUS_HOST" },
       "StringLike": { "OCTOPUS_HOST:sub": "space:default:project:nextjs-alb-demo:*" }
     }
   }]
 }
 ```
 
-**Example of Policy 1 with the values filled in.** For account `123456789012` and an Octopus Cloud instance at `my-company.octopus.app`, the identity provider's URL is `https://my-company.octopus.app`, and `OCTOPUS_HOST` becomes `my-company.octopus.app` in all three places (the provider ARN and both condition keys). The host must match the provider URL exactly, so use the full host name, not just the instance name:
+**Example of Policy 1 with the values filled in.** For account `123456789012` and an Octopus Cloud instance at `my-company.octopus.app`, the identity provider's URL is `https://my-company.octopus.app`, and `OCTOPUS_HOST` becomes `my-company.octopus.app` in all four places (the provider ARN, both condition keys and the audience value). The host must match the provider URL exactly, so use the full host name, not just the instance name:
 
 ```json
 {
@@ -416,9 +425,9 @@ Octopus Deploy does the rollout, so it gets its own narrow role: write the versi
   "Statement": [{
     "Effect": "Allow",
     "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/my-company.octopus.app" },
-    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Action": ["sts:AssumeRoleWithWebIdentity", "sts:TagSession"],
     "Condition": {
-      "StringEquals": { "my-company.octopus.app:aud": "api://default" },
+      "StringEquals": { "my-company.octopus.app:aud": "my-company.octopus.app" },
       "StringLike": { "my-company.octopus.app:sub": "space:default:project:nextjs-alb-demo:*" }
     }
   }]
@@ -523,13 +532,23 @@ jobs:
           server: ${{ vars.OCTOPUS_URL }}
           service_account_id: ${{ vars.OCTOPUS_SERVICE_ACCOUNT_ID }}
 
-      - name: Create the release and deploy it to Demo
+      - name: Create the release
         if: ${{ vars.OCTOPUS_URL != '' }}
         uses: OctopusDeploy/create-release-action@v3
         with:
+          space: Default
           project: nextjs-alb-demo
           release_number: ${{ env.RELEASE }}
-          deploy_to: Demo
+          ignore_existing: true   # a re-run reuses the release instead of failing
+
+      - name: Deploy it to Demo
+        if: ${{ vars.OCTOPUS_URL != '' }}
+        uses: OctopusDeploy/deploy-release-action@v3
+        with:
+          space: Default
+          project: nextjs-alb-demo
+          release_number: ${{ env.RELEASE }}
+          environments: Demo
 ```
 
 Every image gets two tags: the commit ID (traceability) and the release number such as `1.0.7` (what Octopus and the instances use). Tags are immutable, so a re-run of the same workflow skips the build instead of failing. The two Octopus steps only run once you set the `OCTOPUS_URL` variable in 5.3. Action versions and input names move on, so check each action's page for the current major version and inputs before you rely on them.
@@ -546,15 +565,15 @@ git push
 
 If the **Actions** tab shows no run at all, check your branch. The workflow only triggers on pushes to `main`, and a new local repo may default to `master`. Run `git branch --show-current`; if it prints `master`, run `git branch -M main` and `git push -u origin main`.
 
-If the run fails at the AWS sign-in step with "Not authorized to perform sts:AssumeRoleWithWebIdentity", the role's trust policy does not match your repo and branch exactly. Recheck step 3 of 4.8.
+If the run fails at the AWS sign-in step with "Not authorized to perform sts:AssumeRoleWithWebIdentity", the role's trust policy does not match the token's `sub` claim exactly. The most common cause is a repository that sends the immutable subject (`repo:OWNER@ID/REPO@ID:...`) while the trust policy has the classic form the console wizard writes. Recheck step 3 of 4.8.
 
 ### 5.2 CD: the Octopus Deploy project
 
 In the Octopus web UI:
 
 1. **Infrastructure → Environments → New environment**: name it `Demo`.
-2. **Infrastructure → Accounts → Add account → AWS Account**: choose **OpenID Connect**, name it `aws-demo`, paste the ARN of `nextjs-alb-demo-octopus-role`, restrict it to the `Demo` environment, and choose **Save and test**. If the test fails, compare the subject Octopus shows with the `sub` condition in the 4.9 trust policy.
-3. **Projects → Add project**: name `nextjs-alb-demo`, keep the default lifecycle (it contains your `Demo` environment).
+2. **Infrastructure → Accounts → Add account → AWS Account**: choose **OpenID Connect**, name it `aws-demo`, paste the ARN of `nextjs-alb-demo-octopus-role`, restrict it to the `Demo` environment, and choose **Save**. Do not expect **Save and test** to pass: the test signs in with the subject `space:default:account:aws-demo`, which the 4.9 trust policy deliberately rejects because it only admits this project's deployments. The first deployment in 5.3 is the real test.
+3. **Library → Lifecycles → Add lifecycle**: name it `Demo only` with one phase, `Demo`, holding the `Demo` environment. The Default Lifecycle has no explicit phases, so it steps through every environment in your space in order; if your instance also has Development, Staging or Production, a release cannot go straight to `Demo` ("The release has not been deployed to the required environments"). Then **Projects → Add project**: name `nextjs-alb-demo`, lifecycle `Demo only`.
 4. In the project, open **Variables → Project** and add:
    - `AwsAccount`, type **Amazon Web Services Account**, value `aws-demo`
    - `ParameterName`, value `/nextjs-alb-demo/image-tag`
@@ -604,7 +623,7 @@ This tutorial uses one environment and no approval, so every push deploys. Real 
 
 ### 5.3 Connect GitHub to Octopus and run the first deployment
 
-1. In Octopus open **Configuration → Users → Add service account**, name it `github-actions`, and give it a team or role that can create releases and deploy the project. On its page add an **OpenID Connect** identity with issuer `https://token.actions.githubusercontent.com` and subject `repo:GITHUB_OWNER/acme-status:ref:refs/heads/main` ([GitHub Actions OIDC to Octopus](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-octopus-deploy)). Copy the service account's ID.
+1. In Octopus open **Configuration → Users → Add service account**, name it `github-actions`, and give it a team or role that can create releases and deploy the project. On its page add an **OpenID Connect** identity with issuer `https://token.actions.githubusercontent.com` and the same subject you put in the AWS trust policy in step 3 of 4.8: the immutable `repo:GITHUB_OWNER@ID/acme-status@ID:ref:refs/heads/main` if your repository uses it, otherwise `repo:GITHUB_OWNER/acme-status:ref:refs/heads/main` ([GitHub Actions OIDC to Octopus](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-octopus-deploy)). Copy the service account's ID.
 2. In GitHub add two more repository variables: `OCTOPUS_URL` (your Octopus address) and `OCTOPUS_SERVICE_ACCOUNT_ID`. No API key is stored anywhere.
 3. In the **Actions** tab open the last run and choose **Re-run all jobs**. The build is skipped because the image exists, and the Octopus steps now run.
 4. In Octopus open the project. Release `1.0.N` is deployed to `Demo`. The task log shows `Set image tag`, then `Roll out` reporting that the ASG does not exist yet.
@@ -865,7 +884,7 @@ You now have the core of a real delivery pipeline on a fully private network. A 
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
-| Actions fails at AWS sign-in ("not authorized to perform sts:AssumeRoleWithWebIdentity") | Trust policy does not match the repo or branch, or `id-token: write` is missing | Check the role's trust condition `repo:GITHUB_OWNER/acme-status:ref:refs/heads/main` (case-sensitive) and the `permissions` block in the workflow |
+| Actions fails at AWS sign-in ("not authorized to perform sts:AssumeRoleWithWebIdentity") | Trust policy `sub` does not match the token (often: the repo sends the immutable subject with owner/repo IDs but the policy has the classic form), or `id-token: write` is missing | Run `gh api repos/GITHUB_OWNER/acme-status/actions/oidc/customization/sub`; if `use_immutable_subject` is true, set the trust condition to `sub_claim_prefix` + `:ref:refs/heads/main`, otherwise `repo:GITHUB_OWNER/acme-status:ref:refs/heads/main` (case-sensitive). Also check the `permissions` block in the workflow |
 | Pushed to GitHub but the workflow never starts | Your local branch is `master` (or another name), but the workflow only triggers on `main`, or the file is not at `.github/workflows/ci.yml` | Run `git branch -M main` then `git push -u origin main`. Also confirm the file path on github.com and that Actions are enabled under Settings → Actions |
 | AccessDenied on ECR (in Actions) or on SSM or Auto Scaling (in Octopus) | A placeholder in the policy was not replaced, or a name differs | Make sure `ACCOUNT_ID`, the region and the resource names in the GitHub CI and Octopus rollout policies match what you created |
 | Image push says the tag already exists | Immutable tags and a rebuilt commit | Expected; the workflow skips the build when the image exists. Re-run only if the earlier run failed before the push finished |
@@ -879,5 +898,5 @@ You now have the core of a real delivery pipeline on a fully private network. A 
 | Instance refresh never finishes | New instances fail health checks, or the group is at max size | Read the ASG **Activity** tab; fix the cause or cancel the refresh and deploy the previous release in Octopus |
 | No scale-out during the load test | CPU not above target long enough | Keep the load running 5+ minutes, or lower the target value in the scaling policy |
 | Deleting the VPC or a security group fails | Endpoints, network interfaces or security group references remain | Follow the Part 8 order: endpoints, then security groups, then the VPC |
-| Octopus deployment fails at the AWS step (AssumeRoleWithWebIdentity) | The Octopus identity provider, audience or subject does not match the role's trust policy | Compare the issuer, audience and subject on the Octopus AWS account with the 4.9 trust policy; for Octopus Cloud the issuer is your instance URL |
+| Octopus deployment fails at the AWS step ("web identity token provided could not be validated", or AssumeRoleWithWebIdentity) | The IAM provider audience is not the Octopus host name (Octopus sends the host as `aud`, not `api://default`), or the subject does not match the role's trust policy | Compare the issuer, audience and subject on the Octopus AWS account with the 4.9 trust policy; for Octopus Cloud the issuer is your instance URL |
 | Actions run is green but Octopus shows no release | OCTOPUS\_URL is not set, or the service account cannot create releases | Set the two Octopus variables from 5.3, check the service account's permissions, and read the Octopus steps in the Actions log |
